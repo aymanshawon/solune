@@ -21,6 +21,7 @@
 - **☀ ⇄ ☾ in one click.** A little button on your XFCE panel switches the app theme, window borders, icon theme and panel all together.
 - **Wallpapers that follow along.** Put a light and a dark version of the same picture in two folders. When you go dark, the dark version of *the same picture* shows up. No more blinding white wallpaper at midnight (>_<)
 - **Pick by hand any time.** Chose a different wallpaper in XFCE's desktop settings? solune notices, and the next switch uses *that* picture's partner.
+- **⏰ Follows the clock.** Light from 7 AM, dark from 6 PM (times are up to you). Switch by hand any time; your choice stays until the next change.
 - **🎨 Auto mode.** Shows a random picture from a "colorful" folder and changes it every few minutes.
 - **🌫 A soft crossfade.** The screen holds still while everything changes underneath, then gently fades into the new look. No flickering apps.
 - **🐢 Gentle on slow laptops.** Big wallpapers are shrunk to your screen size once, in the background. The panel button never makes the panel stutter.
@@ -79,8 +80,8 @@ Only XFCE itself is required. Without the others, solune still works and just sk
 | on the panel | what happens |
 |---|---|
 | click **☀ / ☾** | switch Light ⇄ Dark |
-| click **▾** | menu: Light, Dark, Auto, Next wallpaper, Open wallpaper folder, Edit settings |
-| hover | current mode, wallpaper name, and time until the next Auto change |
+| click **▾** | menu: Light, Dark, Auto, Next wallpaper, day/night schedule on/off, Open wallpaper folder, Edit settings |
+| hover | current mode, wallpaper name, next scheduled change, and time until the next Auto change |
 
 The icon shows where you are: ☀ light, ☾ dark, 🖼 auto.
 
@@ -96,6 +97,7 @@ Prefer the keyboard? *Settings → Keyboard → Application Shortcuts → Add* �
 | `solune auto` | Auto mode (random colorful wallpaper) |
 | `solune next` | next wallpaper in the current mode |
 | `solune menu` | open the ▾ menu |
+| `solune schedule` | show the day/night schedule; `solune schedule on` / `off` to switch it |
 | `solune status` | mode, wallpaper, folders, fade status, and pictures without a partner |
 | `solune config` | open your settings (`~/.solune/solune.conf`) |
 | `solune apply` | apply changed settings right now |
@@ -143,6 +145,21 @@ You can still choose any wallpaper the normal way (*right-click the desktop → 
 
 Supported: jpg, png, webp, bmp, gif, tiff, svg, jxl, avif. Subfolders are fine too.
 
+## ⏰ day & night schedule
+
+Out of the box, solune goes **light at 07:00** and **dark at 18:00**. If you install it at 7 PM, it turns dark right away.
+
+- **Your clicks win.** Switch to light at 9 PM, and solune leaves it light until the next scheduled change (07:00, when it's light anyway).
+- **Missed a change?** If your laptop was off at 18:00, solune catches up when you log in.
+- **In Auto mode**, only the theme follows the clock. Your colorful wallpapers keep rotating.
+- **Your own hours:** set `DAY_START` and `NIGHT_START` in the settings (24-hour clock, e.g. `"06:30"` and `"19:45"`).
+- **Turn it off:** ▾ menu → *Day/night schedule*, or `solune schedule off`.
+
+```bash
+$ solune schedule
+Schedule: on. Light from 07:00, dark from 18:00. Now it's dark time; light at 07:00.
+```
+
 ## 🎨 auto mode
 
 Pick **Auto** from the ▾ menu. solune shows a random picture from `colorful/` (never the same one twice in a row) and changes it every 10 minutes. Click the ☀/☾ icon any time to go back to your light/dark pair.
@@ -164,7 +181,9 @@ solune apply      # use the changes right now, instead of on the next switch
 | `WALLPAPER_DIR` | your main wallpaper folder |
 | `LIGHT_DIR` · `DARK_DIR` · `COLORFUL_DIR` | the three folders (names inside `WALLPAPER_DIR`, or full paths) |
 | `AUTO_INTERVAL` | minutes between Auto changes (default `10`) |
-| `AUTO_THEME` | theme while in Auto: `""` keeps the current one, or `light` / `dark` |
+| `AUTO_THEME` | theme while in Auto: `""` keeps the current one (and lets the schedule change it), or `light` / `dark` |
+| `SCHEDULE` | `true` / `false`: switch light/dark by the clock (default `true`) |
+| `DAY_START` · `NIGHT_START` | when light and dark begin, 24-hour clock (default `"07:00"` and `"18:00"`) |
 | `LIGHT_GTK_THEME` · `DARK_GTK_THEME` | app theme for each mode |
 | `LIGHT_WM_THEME` · `DARK_WM_THEME` | window border theme for each mode |
 | `LIGHT_ICON_THEME` · `DARK_ICON_THEME` | icon theme for each mode |
@@ -235,7 +254,7 @@ solune is one Bash script plus a tiny Python helper for the fade. Everything goe
 | wallpaper | `xfce4-desktop` → `…/last-image` on every monitor and workspace |
 | dark preference for GTK4, browsers, Electron | `gsettings` → `org.gnome.desktop.interface color-scheme` |
 
-- **The panel button** is an [xfce4-genmon-plugin](https://docs.xfce.org/panel-plugins/xfce4-genmon-plugin/start) item that runs `solune panel` every 10 seconds. That call only reads a tiny state file (≈10 ms), so the panel never stutters.
+- **The panel button** is an [xfce4-genmon-plugin](https://docs.xfce.org/panel-plugins/xfce4-genmon-plugin/start) item that runs `solune panel` every 10 seconds. That call only reads a tiny state file (≈10 ms), so the panel never stutters. It's also the clock for the day/night schedule and Auto mode, so both keep working after a reboot without any extra service.
 - **Screen-sized copies** of your wallpapers live in `~/.solune/resized/`, with the same folders and names as the originals (e.g. `resized/1366x768/light/debian-white.jpg`). Loading a 64-megapixel photo can take xfdesktop most of a second; a screen-sized copy loads in a blink. They're made once, at the lowest CPU priority, and rebuilt by themselves when you add or edit pictures or plug in a bigger monitor. Your originals are never changed.
 - **The fade helper** (`solune-fade`, Python + GTK) starts at login and waits quietly in the background, so a switch doesn't have to start it first.
 

@@ -10,6 +10,7 @@
 #   auto            Random colorful wallpaper that changes every few minutes
 #   next            Next wallpaper in the current mode
 #   menu            Little menu with all of the above
+#   schedule        Day/night schedule: show it, or turn it `on` / `off`
 #   status          Mode, wallpaper, folders, and pictures without a partner
 #   config          Open your settings (~/.solune/solune.conf)
 #   apply           Apply changed settings right now
@@ -22,7 +23,7 @@
 set -uo pipefail
 shopt -u patsub_replacement 2>/dev/null || true
 
-SOLUNE_VERSION="1.1.0"
+SOLUNE_VERSION="1.2.0"
 
 SELF=${BASH_SOURCE[0]}
 [[ -L $SELF || $SELF != /* ]] && SELF=$(readlink -f "$SELF")
@@ -66,6 +67,9 @@ DARK_PANEL_DARK=""
 PANEL_ICON_LIGHT="weather-clear"
 PANEL_ICON_DARK="weather-clear-night"
 PANEL_ICON_AUTO="preferences-desktop-wallpaper"
+SCHEDULE=true
+DAY_START="07:00"
+NIGHT_START="18:00"
 ANIMATION=true
 ANIMATION_MS=400
 NOTIFY=false
@@ -89,6 +93,20 @@ load_config() {
     resolve_dir COLORFUL_DIR
     [[ $AUTO_INTERVAL =~ ^[0-9]+$ ]] && ((AUTO_INTERVAL > 0)) || AUTO_INTERVAL=10
     [[ $ANIMATION_MS =~ ^[0-9]+$ ]] && ((ANIMATION_MS <= 3000)) || ANIMATION_MS=400
+    clock_minutes "$DAY_START" 420 DAY_MIN || DAY_START="07:00"
+    clock_minutes "$NIGHT_START" 1080 NIGHT_MIN || NIGHT_START="18:00"
+}
+
+# Sets <var> to a 24-hour "HH:MM" as minutes after midnight, or to <default>
+# (and fails) when it isn't a valid time.
+clock_minutes() {
+    local -n minutes_ref=$3
+    if [[ $1 =~ ^([01]?[0-9]|2[0-3]):([0-5][0-9])$ ]]; then
+        minutes_ref=$((10#${BASH_REMATCH[1]} * 60 + 10#${BASH_REMATCH[2]}))
+    else
+        minutes_ref=$2
+        return 1
+    fi
 }
 
 # ------------------------------------------------------------------- state --
@@ -98,6 +116,7 @@ PAIR=""
 CURRENT=""  # the original picture
 SHOWN=""    # the file solune handed to xfdesktop (often its resized copy)
 LAST_AUTO=0
+SCHED_DONE=0 # start of the last day/night period the schedule has handled
 
 load_state() {
     # shellcheck source=/dev/null
@@ -113,6 +132,7 @@ save_state() {
         printf 'CURRENT=%q\n' "$CURRENT"
         printf 'SHOWN=%q\n' "$SHOWN"
         printf 'LAST_AUTO=%q\n' "$LAST_AUTO"
+        printf 'SCHED_DONE=%q\n' "$SCHED_DONE"
     } >"$STATE.tmp" && mv -f "$STATE.tmp" "$STATE"
 }
 
@@ -262,6 +282,33 @@ current_wallpaper() {
     else
         CUR=$CURRENT
     fi
+}
+
+# Sets PERIOD (light or dark) for the clock right now, PERIOD_START (when that
+# period began, as a timestamp), and NEXT_PERIOD / NEXT_AT for the next change.
+# Uses only shell builtins: the panel calls this every few seconds.
+schedule_now() {
+    local now h m sec midnight day night t at
+    printf -v now '%(%s)T' -1
+    printf -v h '%(%H)T' "$now"
+    printf -v m '%(%M)T' "$now"
+    printf -v sec '%(%S)T' "$now"
+    midnight=$((now - 10#$h * 3600 - 10#$m * 60 - 10#$sec))
+    # SOLUNE_TIME=HH:MM pretends it's that time today (for trying things out).
+    if [[ ${SOLUNE_TIME:-} =~ ^([0-9]{1,2}):([0-9]{2})$ ]]; then
+        now=$((midnight + 10#${BASH_REMATCH[1]} * 3600 + 10#${BASH_REMATCH[2]} * 60))
+    fi
+    day=$((midnight + DAY_MIN * 60)) night=$((midnight + NIGHT_MIN * 60))
+
+    # The latest change at or before now, looking back into yesterday too.
+    PERIOD=dark PERIOD_START=0
+    for t in "$day:light" "$night:dark" "$((day - 86400)):light" "$((night - 86400)):dark"; do
+        at=${t%%:*}
+        if ((at <= now && at > PERIOD_START)); then
+            PERIOD_START=$at PERIOD=${t#*:}
+        fi
+    done
+    if [[ $PERIOD == light ]]; then NEXT_PERIOD=dark NEXT_AT=$NIGHT_START; else NEXT_PERIOD=light NEXT_AT=$DAY_START; fi
 }
 
 # Runs "$@" in the background, fully cut off from us. Closes every inherited
@@ -638,6 +685,11 @@ cmd_panel() {
     if [[ $MODE == auto ]] && ((now - LAST_AUTO >= AUTO_INTERVAL * 60)); then
         detach "$SELF" tick
     fi
+    # A new day or night has begun (or began while the computer was off).
+    if [[ $SCHEDULE == true ]]; then
+        schedule_now
+        ((SCHED_DONE < PERIOD_START)) && detach "$SELF" sched
+    fi
     # Start the animation helper at login, so the first click is quick too.
     if [[ $ANIMATION == true ]] && ! fade_alive; then
         [[ -r $RUN_DIR/fade.spawned ]] && read -r spawned <"$RUN_DIR/fade.spawned"
@@ -659,6 +711,7 @@ cmd_panel() {
         ((left < 1)) && left=1
         tip+=$'\n'"Next change in ~$left min"
     fi
+    [[ $SCHEDULE == true ]] && tip+=$'\n'"Schedule: $NEXT_PERIOD at $NEXT_AT"
     tip+=$'\n\n'"Click icon: switch Light ⇄ Dark"$'\n'"Click ▾: Auto, Next wallpaper, settings…"
 
     printf '<icon>%s</icon><iconclick>%s toggle</iconclick>' "$icon" "$SELF"
@@ -668,19 +721,25 @@ cmd_panel() {
 
 cmd_menu() {
     command -v zenity >/dev/null || die "zenity is not installed"
-    local now choice
+    local now choice sched
     case $MODE in
         dark) now="Dark" ;;
         auto) now="Auto (colorful)" ;;
         *) now="Light" ;;
     esac
+    if [[ $SCHEDULE == true ]]; then
+        sched="◷  Day/night schedule: on  (light $DAY_START, dark $NIGHT_START) — turn off"
+    else
+        sched="◷  Day/night schedule: off  — turn on"
+    fi
     choice=$(zenity --list --title="solune" --text="Current mode: $now" \
         --hide-header --column=id --column=Action --hide-column=1 --print-column=1 \
-        --width=400 --height=440 \
+        --width=460 --height=470 \
         light "☀  Light  —  light theme + light wallpaper" \
         dark "☾  Dark  —  dark theme + dark wallpaper" \
         auto "✿  Auto  —  random colorful wallpaper every $AUTO_INTERVAL min" \
         next "↻  Next wallpaper" \
+        schedule "$sched" \
         folder "▤  Open wallpaper folder" \
         settings "⚙  Edit settings" 2>/dev/null) || return 0
     choice=${choice%%|*}
@@ -695,7 +754,68 @@ cmd_menu() {
             xdg-open "$WALLPAPER_DIR" &>/dev/null &
             ;;
         settings) cmd_config >/dev/null ;;
+        schedule)
+            if [[ $SCHEDULE == true ]]; then cmd_schedule off; else cmd_schedule on; fi >/dev/null
+            ;;
     esac
+}
+
+# Called by the panel when a new day or night period begins: switch to it.
+# A switch you make yourself counts for the rest of that period.
+cmd_sched() {
+    take_lock -n || return 0
+    load_state
+    [[ $SCHEDULE == true ]] || return 0
+    schedule_now
+    ((SCHED_DONE < PERIOD_START)) || return 0
+    SCHED_DONE=$PERIOD_START
+    save_state
+    if [[ $MODE == auto ]]; then
+        # Keep the colorful wallpapers; only the theme follows the clock.
+        [[ -z $AUTO_THEME && $(current_theme) != "$PERIOD" ]] || return 0
+        local mine=0
+        freeze_screen && mine=1
+        apply_theme "$PERIOD"
+        refresh_panel
+        ((mine)) && unfreeze_screen 200 2500
+    elif [[ $MODE != "$PERIOD" || $(current_theme) != "$PERIOD" ]]; then
+        mkdir -p "$LIGHT_DIR" "$DARK_DIR"
+        go_theme "$PERIOD"
+    fi
+    return 0
+}
+
+# solune schedule [on|off]: show the day/night schedule, or switch it on/off.
+cmd_schedule() {
+    case ${1:-} in
+        on | off)
+            local value=true
+            [[ $1 == off ]] && value=false
+            mkdir -p "$SOLUNE_HOME"
+            touch "$CONF"
+            if grep -q '^SCHEDULE=' "$CONF"; then
+                sed -i "s/^SCHEDULE=[a-z]*/SCHEDULE=$value/" "$CONF"
+            else
+                printf '\nSCHEDULE=%s\n' "$value" >>"$CONF"
+            fi
+            SCHEDULE=$value
+            if [[ $value == true ]]; then
+                # Follow the clock right away.
+                SCHED_DONE=0
+                save_state
+                cmd_sched
+            fi
+            refresh_panel
+            ;;
+        "") ;;
+        *) die "usage: solune schedule [on|off]" ;;
+    esac
+    schedule_now
+    if [[ $SCHEDULE == true ]]; then
+        echo "Schedule: on. Light from $DAY_START, dark from $NIGHT_START. Now it's $PERIOD time; $NEXT_PERIOD at $NEXT_AT."
+    else
+        echo "Schedule: off. Turn it on with: solune schedule on"
+    fi
 }
 
 # Opens your settings. They apply on the next switch, or now with `solune apply`.
@@ -795,6 +915,12 @@ cmd_status() {
     done < <(list_images "$LIGHT_DIR"; list_images "$DARK_DIR"; list_images "$COLORFUL_DIR")
     printf 'Resized:    %d of %d ready for %sx%s\n' "$ready" "$total" "$SCREEN_W" "$SCREEN_H"
     printf 'Animation:  %s\n' "$anim"
+    schedule_now
+    if [[ $SCHEDULE == true ]]; then
+        printf 'Schedule:   on, light from %s, dark from %s (%s at %s)\n' "$DAY_START" "$NIGHT_START" "$NEXT_PERIOD" "$NEXT_AT"
+    else
+        printf 'Schedule:   off\n'
+    fi
     printf 'Settings:   %s  (change any time: solune config)\n' "$CONF"
 
     while IFS= read -r f; do
@@ -999,6 +1125,12 @@ run_action() {
     take_lock -w 15 || die "another switch is still running"
     load_state
     mkdir -p "$LIGHT_DIR" "$DARK_DIR" "$COLORFUL_DIR"
+    # Switching by hand settles the current day/night period: the schedule
+    # leaves your choice alone until the next change.
+    if [[ $SCHEDULE == true && $1 == @(toggle|light|dark) ]]; then
+        schedule_now
+        SCHED_DONE=$PERIOD_START
+    fi
     "cmd_$1"
 }
 
@@ -1014,7 +1146,11 @@ main() {
             load_state
             "cmd_$cmd"
             ;;
-        tick | cache | uninstall) "cmd_$cmd" ;;
+        tick | sched | cache | uninstall) "cmd_$cmd" ;;
+        schedule)
+            load_state
+            cmd_schedule "${2:-}"
+            ;;
         paths) printf '%s\n' "$LIGHT_DIR" "$DARK_DIR" "$COLORFUL_DIR" ;;
         add-button) cmd_add_button ;;
         remove-button) cmd_remove_button ;;

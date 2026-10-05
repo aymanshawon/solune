@@ -275,6 +275,24 @@ stop_helper() {
     sleep 0.3
 }
 
+# Settings added by an update get appended to an existing settings file, with
+# their comments, so they show up for editing. Values you set are untouched.
+add_new_settings() {
+    local line key block="" added=()
+    while IFS= read -r line; do
+        if [[ $line =~ ^([A-Z_]+)= ]]; then
+            key=${BASH_REMATCH[1]}
+            if ! grep -q "^$key=" "$CONF"; then
+                block+="$line"$'\n'
+                added+=("$key")
+            fi
+        fi
+    done <"$SRC/solune.conf"
+    ((${#added[@]})) || return 0
+    printf '\n# ---- Added by an update (see the README) -----------------------------------\n%s' "$block" >>"$CONF"
+    ok "New settings added to your settings file: ${added[*]}"
+}
+
 # solune 1.0 kept its files in ~/.config, ~/.local/share and ~/.local/state.
 # Move the settings and state over to ~/.solune and remove the rest.
 migrate_old() {
@@ -319,6 +337,7 @@ do_install() {
     # Settings: keep existing ones, only moving the wallpaper folder if asked.
     if [[ -f $CONF ]]; then
         [[ -n $wall_dir ]] && { WALL_DIR=$wall_dir; set_conf WALLPAPER_DIR "${WALL_DIR/#$HOME/\~}"; }
+        add_new_settings
         ok "Kept your settings in ${CONF/#$HOME/\~}"
     else
         WALL_DIR=${wall_dir:-$DEFAULT_WALL_DIR}
