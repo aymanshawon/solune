@@ -1,0 +1,1030 @@
+#!/usr/bin/env bash
+# solune — one-click light/dark mode for XFCE, with matching wallpapers.
+# https://github.com/aymanshawon/solune · MIT License
+#
+# Usage: solune [command]
+#
+#   toggle          Light <-> Dark (the default)
+#   light           Light theme + light version of the wallpaper
+#   dark            Dark theme + dark version of the wallpaper
+#   auto            Random colorful wallpaper that changes every few minutes
+#   next            Next wallpaper in the current mode
+#   menu            Little menu with all of the above
+#   status          Mode, wallpaper, folders, and pictures without a partner
+#   config          Open your settings (~/.solune/solune.conf)
+#   apply           Apply changed settings right now
+#   cache           Make screen-sized copies of the wallpapers (runs by itself)
+#   add-button      Put the solune button on the XFCE panel
+#   remove-button   Take the button off the panel
+#   uninstall       Remove the button and show the full-size wallpaper again
+#   version         Print the version
+
+set -uo pipefail
+shopt -u patsub_replacement 2>/dev/null || true
+
+SOLUNE_VERSION="1.1.0"
+
+SELF=${BASH_SOURCE[0]}
+[[ -L $SELF || $SELF != /* ]] && SELF=$(readlink -f "$SELF")
+BASE_DIR=${SELF%/*}
+FADE_BIN="$BASE_DIR/solune-fade"
+
+# Everything solune keeps lives in ~/.solune: your settings, its state, and
+# screen-sized copies of the wallpapers (named like the originals).
+SOLUNE_HOME="${SOLUNE_HOME:-$HOME/.solune}"
+CONF="$SOLUNE_HOME/solune.conf"
+STATE_DIR="$SOLUNE_HOME/state"
+STATE="$STATE_DIR/state"
+LOCK="$STATE_DIR/lock"
+BUTTON_FILE="$STATE_DIR/button"
+RESIZED_DIR="$SOLUNE_HOME/resized"
+if [[ -n ${XDG_RUNTIME_DIR:-} ]]; then RUN_DIR="$XDG_RUNTIME_DIR/solune"; else RUN_DIR="/tmp/solune-$UID"; fi
+FADE_FIFO="$RUN_DIR/fade.fifo"
+FADE_PID="$RUN_DIR/fade.pid"
+PANEL_RC_DIR="$HOME/.config/xfce4/panel"
+
+IMG_RE='.*\.(jpe?g|png|webp|bmp|gif|tiff?|svg|jxl|avif)$'
+VARIANT='(dark|light|white|black|day|night)'
+
+# ---------------------------------------------------------------- settings --
+# Defaults; ~/.solune/solune.conf overrides them.
+
+WALLPAPER_DIR="~/.solune-wallpaper"
+LIGHT_DIR="light"
+DARK_DIR="dark"
+COLORFUL_DIR="colorful"
+AUTO_INTERVAL=10
+AUTO_THEME=""
+LIGHT_GTK_THEME="Adwaita"
+LIGHT_WM_THEME=""
+LIGHT_ICON_THEME=""
+LIGHT_PANEL_DARK=""
+DARK_GTK_THEME="Adwaita-dark"
+DARK_WM_THEME=""
+DARK_ICON_THEME=""
+DARK_PANEL_DARK=""
+PANEL_ICON_LIGHT="weather-clear"
+PANEL_ICON_DARK="weather-clear-night"
+PANEL_ICON_AUTO="preferences-desktop-wallpaper"
+ANIMATION=true
+ANIMATION_MS=400
+NOTIFY=false
+
+# Makes a folder setting absolute: relative to WALLPAPER_DIR, ~ allowed.
+resolve_dir() {
+    local -n dir_ref=$1
+    dir_ref=${dir_ref/#\~/$HOME}
+    [[ $dir_ref == /* ]] || dir_ref="$WALLPAPER_DIR/$dir_ref"
+    dir_ref=${dir_ref%/}
+}
+
+load_config() {
+    # shellcheck source=/dev/null
+    [[ -f $CONF ]] && source "$CONF"
+    [[ -n $WALLPAPER_DIR ]] || WALLPAPER_DIR="$HOME/.solune-wallpaper"
+    WALLPAPER_DIR=${WALLPAPER_DIR/#\~/$HOME}
+    WALLPAPER_DIR=${WALLPAPER_DIR%/}
+    resolve_dir LIGHT_DIR
+    resolve_dir DARK_DIR
+    resolve_dir COLORFUL_DIR
+    [[ $AUTO_INTERVAL =~ ^[0-9]+$ ]] && ((AUTO_INTERVAL > 0)) || AUTO_INTERVAL=10
+    [[ $ANIMATION_MS =~ ^[0-9]+$ ]] && ((ANIMATION_MS <= 3000)) || ANIMATION_MS=400
+}
+
+# ------------------------------------------------------------------- state --
+
+MODE=""
+PAIR=""
+CURRENT=""  # the original picture
+SHOWN=""    # the file solune handed to xfdesktop (often its resized copy)
+LAST_AUTO=0
+
+load_state() {
+    # shellcheck source=/dev/null
+    [[ -f $STATE ]] && source "$STATE"
+    [[ $MODE == @(light|dark|auto) ]] || MODE=$(current_theme)
+}
+
+save_state() {
+    mkdir -p "$STATE_DIR"
+    {
+        printf 'MODE=%q\n' "$MODE"
+        printf 'PAIR=%q\n' "$PAIR"
+        printf 'CURRENT=%q\n' "$CURRENT"
+        printf 'SHOWN=%q\n' "$SHOWN"
+        printf 'LAST_AUTO=%q\n' "$LAST_AUTO"
+    } >"$STATE.tmp" && mv -f "$STATE.tmp" "$STATE"
+}
+
+# Serialize actions so a click and the panel timer never change things at once.
+take_lock() {
+    mkdir -p "$STATE_DIR"
+    exec 9>"$LOCK"
+    flock "$@" 9
+}
+
+# ------------------------------------------------------------------ helpers --
+
+warn() { printf 'solune: %s\n' "$*" >&2; }
+die() { warn "$*"; exit 1; }
+
+notify() {
+    [[ $NOTIFY == true ]] && command -v notify-send >/dev/null &&
+        notify-send -a solune -t 2000 -i "$1" "$2" "${3:-}"
+    return 0
+}
+
+# Sets ESCAPED to <text> made safe for genmon's markup.
+xml_escape() {
+    ESCAPED=$1
+    ESCAPED=${ESCAPED//&/&amp;}
+    ESCAPED=${ESCAPED//</&lt;}
+    ESCAPED=${ESCAPED//>/&gt;}
+}
+
+list_images() {
+    [[ -d $1 ]] || return 0
+    find -L "$1" -type f -regextype posix-extended -iregex "$IMG_RE" 2>/dev/null | sort
+}
+
+# Sets KEY to the pairing key of a file: "debian-white.jpg" -> "debian".
+pair_key() {
+    local n=${1##*/}
+    n=${n%.*}
+    n=${n,,}
+    local suffix="^(.+)[-_. ]+$VARIANT\$" prefix="^$VARIANT[-_. ]+(.+)\$"
+    while [[ $n =~ $suffix ]]; do n=${BASH_REMATCH[1]}; done
+    while [[ $n =~ $prefix ]]; do n=${BASH_REMATCH[2]}; done
+    KEY=$n
+}
+
+# Prints the image in <dir> whose pairing key is <key>.
+find_variant() {
+    local key=$1 dir=$2 f
+    while IFS= read -r f; do
+        pair_key "$f"
+        [[ $KEY == "$key" ]] && { printf '%s\n' "$f"; return 0; }
+    done < <(list_images "$dir")
+    return 1
+}
+
+# Prints a random image from <dir>, avoiding <exclude> when there is a choice.
+random_image() {
+    local dir=$1 exclude=${2:-} f
+    local -a imgs=()
+    while IFS= read -r f; do
+        [[ $f != "$exclude" ]] && imgs+=("$f")
+    done < <(list_images "$dir")
+    if ((${#imgs[@]} == 0)); then
+        [[ -n $exclude && -f $exclude && $exclude == "$dir"/* ]] && { printf '%s\n' "$exclude"; return 0; }
+        return 1
+    fi
+    printf '%s\n' "${imgs[RANDOM % ${#imgs[@]}]}"
+}
+
+in_dir() { [[ -n $1 && $1 == "$2"/* ]]; }
+
+theme_exists() {
+    local d
+    for d in "$HOME/.themes" "$HOME/.local/share/themes" /usr/local/share/themes /usr/share/themes \
+        "$HOME/.icons" "$HOME/.local/share/icons" /usr/local/share/icons /usr/share/icons; do
+        [[ -d $d/$1 ]] && return 0
+    done
+    return 1
+}
+
+current_theme() {
+    local name
+    name=$(xfconf-query -c xsettings -p /Net/ThemeName 2>/dev/null)
+    if [[ $name == "$DARK_GTK_THEME" || ${name,,} == *dark* ]]; then echo dark; else echo light; fi
+}
+
+# ImageMagick 7 is "magick", 6 is "convert"/"identify".
+imagemagick() {
+    if command -v magick >/dev/null; then
+        IM_CONVERT=(magick) IM_IDENTIFY=(magick identify)
+    elif command -v convert >/dev/null; then
+        IM_CONVERT=(convert) IM_IDENTIFY=(identify)
+    else
+        return 1
+    fi
+}
+
+MONS=()
+SCREEN_W=""
+SCREEN_H=""
+
+# Sets MONS to the connected outputs and SCREEN_W x SCREEN_H to the largest
+# of their sizes. Runs xrandr once per run of the script.
+screen_info() {
+    [[ -n $SCREEN_W ]] && return
+    MONS=() SCREEN_W=0 SCREEN_H=0
+    local name state rest w h
+    while read -r name state rest; do
+        [[ $state == connected ]] || continue
+        MONS+=("$name")
+        [[ $rest =~ ([0-9]+)x([0-9]+)\+ ]] || continue
+        w=${BASH_REMATCH[1]} h=${BASH_REMATCH[2]}
+        ((w > SCREEN_W)) && SCREEN_W=$w
+        ((h > SCREEN_H)) && SCREEN_H=$h
+    done < <(xrandr --current 2>/dev/null)
+    ((SCREEN_W && SCREEN_H)) || SCREEN_W=1920 SCREEN_H=1080
+}
+
+# Sets CUR to the original picture on screen right now. When you picked a
+# wallpaper yourself (XFCE's desktop settings), that one counts, not the one
+# solune set last.
+current_wallpaper() {
+    screen_info
+    local p val ws=0 single="" single_ws=0 live=""
+    local -A images=()
+    while read -r p val; do
+        case $p in
+            /backdrop/*/workspace*/last-image) images[$p]=$val ;;
+            /backdrop/single-workspace-mode) single=$val ;;
+            /backdrop/single-workspace-number) single_ws=$val ;;
+        esac
+    done < <(xfconf-query -c xfce4-desktop -lv 2>/dev/null)
+
+    # The workspace you're looking at (or the shared one, with "apply to all
+    # workspaces" on).
+    if [[ $single == true ]]; then
+        ws=$single_ws
+    elif command -v xprop >/dev/null; then
+        val=$(xprop -root -notype _NET_CURRENT_DESKTOP 2>/dev/null)
+        [[ ${val##* } =~ ^[0-9]+$ ]] && ws=${val##* }
+    fi
+    ((${#MONS[@]})) && live=${images[/backdrop/screen0/monitor${MONS[0]}/workspace$ws/last-image]:-}
+
+    if [[ -n $live && $live != "$SHOWN" ]]; then
+        original_of "$live"
+        CUR=$ORIGINAL
+    else
+        CUR=$CURRENT
+    fi
+}
+
+# Runs "$@" in the background, fully cut off from us. Closes every inherited
+# file descriptor first: the panel waits until its command's output pipe is
+# closed, so a long-running child holding a copy would freeze the button.
+detach() {
+    (
+        local fd
+        for fd in /proc/$BASHPID/fd/*; do
+            fd=${fd##*/}
+            [[ $fd =~ ^[0-9]+$ ]] && ((fd > 2)) && eval "exec $fd>&-"
+        done
+        exec setsid "$@" </dev/null &>/dev/null
+    ) &
+}
+
+# ---------------------------------------------------------------- animation --
+# solune-fade, a small Python helper that stays running, covers the screen with
+# a still picture of itself ("freeze") while things change underneath, then
+# fades that picture out ("fade").
+
+FROZEN=0
+
+fade_alive() {
+    local pid=""
+    [[ -p $FADE_FIFO && -r $FADE_PID ]] || return 1
+    read -r pid <"$FADE_PID" 2>/dev/null || return 1
+    [[ -n $pid && -d /proc/$pid ]]
+}
+
+fade_spawn() {
+    [[ -f $FADE_BIN ]] && command -v python3 >/dev/null || return 1
+    mkdir -p -m 700 "$RUN_DIR" || return 1
+    printf -v FADE_SPAWNED '%(%s)T' -1
+    printf '%s\n' "$FADE_SPAWNED" >"$RUN_DIR/fade.spawned"
+    detach python3 "$FADE_BIN" daemon "$RUN_DIR"
+}
+
+# Covers the screen. Fails (and nothing happens) when animation is off or
+# can't work here, e.g. without a compositor.
+freeze_screen() {
+    ((FROZEN)) && return 1
+    [[ $ANIMATION == true && -n ${DISPLAY:-} ]] || return 1
+    if ! fade_alive; then
+        fade_spawn || return 1
+        local i
+        for ((i = 0; i < 40; i++)); do
+            fade_alive && break
+            sleep 0.05
+        done
+        fade_alive || return 1
+    fi
+
+    local reply="$RUN_DIR/reply.$$" line="" in out
+    rm -f "$reply"
+    mkfifo -m 600 "$reply" 2>/dev/null || return 1
+    exec {in}<>"$reply"
+    exec {out}<>"$FADE_FIFO"
+    printf 'freeze %s\n' "$reply" >&"$out"
+    exec {out}>&-
+    read -r -t 1 -u "$in" line
+    exec {in}<&-
+    rm -f "$reply"
+    [[ $line == ready ]] || return 1
+    FROZEN=1
+    trap 'unfreeze_screen 0' EXIT
+}
+
+# Fades the still picture away. Waits <settle-ms>, then until the CPU calms
+# down (apps redrawing for a new theme), but no longer than <max-wait-ms>.
+unfreeze_screen() {
+    ((FROZEN)) || return 0
+    FROZEN=0
+    local out
+    exec {out}<>"$FADE_FIFO" 2>/dev/null || return 0
+    printf 'fade %d %d %d\n' "${1:-150}" "$ANIMATION_MS" "${2:-0}" >&"$out"
+    exec {out}>&-
+}
+
+# --------------------------------------------------------- resized copies --
+
+# Sets RESIZED to where the screen-sized copy of <img> lives (it may not exist
+# yet). Copies mirror your folders and keep their names, e.g.
+#   ~/.solune/resized/1366x768/light/debian-white.jpg
+# Returns 1 for pictures outside the light/dark/colorful folders.
+resized_path() {
+    local img=$1 cat rel
+    if in_dir "$img" "$LIGHT_DIR"; then
+        cat=light rel=${img#"$LIGHT_DIR"/}
+    elif in_dir "$img" "$DARK_DIR"; then
+        cat=dark rel=${img#"$DARK_DIR"/}
+    elif in_dir "$img" "$COLORFUL_DIR"; then
+        cat=colorful rel=${img#"$COLORFUL_DIR"/}
+    else
+        RESIZED=""
+        return 1
+    fi
+    [[ ${rel,,} == *.@(jpg|jpeg) ]] || rel+=".jpg"
+    RESIZED="$RESIZED_DIR/${SCREEN_W}x${SCREEN_H}/$cat/$rel"
+}
+
+# True when the copy at RESIZED is up to date for <img>: a symlink (picture
+# already small) or a file at least as new as the original.
+resized_ready() {
+    [[ -L $RESIZED ]] || [[ -f $RESIZED && ! $1 -nt $RESIZED ]]
+}
+
+# Sets ORIGINAL to the picture a resized copy was made from, or to <path>
+# itself when it isn't one of solune's copies.
+original_of() {
+    ORIGINAL=$1
+    [[ $1 == "$RESIZED_DIR"/*/* ]] || return 0
+    local rel=${1#"$RESIZED_DIR"/*/} cat base
+    cat=${rel%%/*} rel=${rel#*/}
+    case $cat in
+        light) base=$LIGHT_DIR ;;
+        dark) base=$DARK_DIR ;;
+        colorful) base=$COLORFUL_DIR ;;
+        *) return 0 ;;
+    esac
+    if [[ -e $base/$rel ]]; then
+        ORIGINAL=$base/$rel
+    elif [[ $rel == *.jpg && -e $base/${rel%.jpg} ]]; then
+        ORIGINAL=$base/${rel%.jpg}
+    fi
+}
+
+# Makes the screen-sized copy of <src> at <dst>. Pictures that are already
+# small enough get a symlink to the original instead.
+make_resized() {
+    local src=$1 dst=$2 w="" h=""
+    mkdir -p "${dst%/*}"
+    read -r w h < <("${IM_IDENTIFY[@]}" -ping -format '%w %h\n' "$src[0]" 2>/dev/null)
+    if [[ $w =~ ^[0-9]+$ && $h =~ ^[0-9]+$ ]] && ((w > SCREEN_W && h > SCREEN_H)); then
+        # jpeg:size lets libjpeg decode big JPEGs at a fraction of full size.
+        if nice -n 19 ionice -c 3 "${IM_CONVERT[@]}" -define jpeg:size="$((SCREEN_W * 2))x$((SCREEN_H * 2))" \
+            "$src[0]" -auto-orient -background black -flatten \
+            -resize "${SCREEN_W}x${SCREEN_H}^" -strip -quality 92 "$dst.part.jpg" </dev/null 2>/dev/null; then
+            mv -f "$dst.part.jpg" "$dst"
+            return
+        fi
+        rm -f "$dst.part.jpg"
+    fi
+    ln -sfn "$src" "$dst"
+}
+
+start_resizing() {
+    imagemagick || return 0
+    detach "$SELF" cache
+}
+
+# --------------------------------------------------------------- changing --
+
+ORIGINAL_ONLY=0
+
+# Shows <img> on every monitor and workspace.
+set_wallpaper() {
+    local img=$1 show=$1 p val ws count mon
+    local -A current=()
+    local -a cycling=() pids=()
+    screen_info
+
+    if ((!ORIGINAL_ONLY)) && resized_path "$img"; then
+        if ! resized_ready "$img"; then
+            start_resizing # use the original this once
+        elif [[ ! -L $RESIZED ]]; then
+            show=$RESIZED
+        fi
+    fi
+
+    while read -r p val; do
+        case $p in
+            /backdrop/*/workspace*/last-image) current[$p]=$val ;;
+            /backdrop/*/workspace*/backdrop-cycle-enable) [[ $val == true ]] && cycling+=("$p") ;;
+        esac
+    done < <(xfconf-query -c xfce4-desktop -lv 2>/dev/null)
+
+    # Every connected monitor on every workspace, plus any xfdesktop already knows.
+    if ((${#MONS[@]})); then
+        count=$(xfconf-query -c xfwm4 -p /general/workspace_count 2>/dev/null) || count=1
+        for mon in "${MONS[@]}"; do
+            for ((ws = 0; ws < count; ws++)); do
+                p="/backdrop/screen0/monitor$mon/workspace$ws/last-image"
+                [[ -n ${current[$p]+set} ]] || current[$p]=""
+            done
+        done
+    fi
+    ((${#current[@]})) || { warn "could not find any desktop to set the wallpaper on"; return 1; }
+
+    # xfdesktop's own slideshow would fight us, so turn it off.
+    for p in "${cycling[@]}"; do
+        xfconf-query -c xfce4-desktop -p "$p" -s false &
+        pids+=($!)
+    done
+    for p in "${!current[@]}"; do
+        [[ ${current[$p]} == "$show" ]] && continue
+        xfconf-query -c xfce4-desktop -p "$p" -n -t string -s "$show" &
+        pids+=($!)
+    done
+    ((${#pids[@]})) && wait "${pids[@]}"
+    SHOWN=$show
+    save_state
+    return 0
+}
+
+apply_theme() {
+    local gtk wm icon panel scheme t
+    local -a pids=()
+    if [[ $1 == dark ]]; then
+        gtk=$DARK_GTK_THEME wm=$DARK_WM_THEME icon=$DARK_ICON_THEME panel=$DARK_PANEL_DARK scheme=prefer-dark
+    else
+        gtk=$LIGHT_GTK_THEME wm=$LIGHT_WM_THEME icon=$LIGHT_ICON_THEME panel=$LIGHT_PANEL_DARK scheme=default
+    fi
+    for t in "$gtk" "$wm" "$icon"; do
+        [[ -z $t ]] || theme_exists "$t" || warn "theme '$t' is not installed (check $CONF)"
+    done
+
+    # All at once, so apps restyle in one go instead of once per setting.
+    if [[ -n $gtk ]]; then
+        xfconf-query -c xsettings -p /Net/ThemeName -s "$gtk" &
+        pids+=($!)
+    fi
+    if [[ -n $icon ]]; then
+        xfconf-query -c xsettings -p /Net/IconThemeName -s "$icon" &
+        pids+=($!)
+    fi
+    if [[ -n $wm ]]; then
+        xfconf-query -c xfwm4 -p /general/theme -s "$wm" &
+        pids+=($!)
+    fi
+    if [[ $panel == @(true|false) ]]; then
+        xfconf-query -c xfce4-panel -p /panels/dark-mode -n -t bool -s "$panel" &
+        pids+=($!)
+    fi
+
+    # GTK4/libadwaita apps, browsers and Electron apps read these.
+    if command -v gsettings >/dev/null; then
+        gsettings set org.gnome.desktop.interface color-scheme "$scheme" 2>/dev/null &
+        pids+=($!)
+        if [[ -n $gtk ]]; then
+            gsettings set org.gnome.desktop.interface gtk-theme "$gtk" 2>/dev/null &
+            pids+=($!)
+        fi
+        if [[ -n $icon ]]; then
+            gsettings set org.gnome.desktop.interface icon-theme "$icon" 2>/dev/null &
+            pids+=($!)
+        fi
+    fi
+    ((${#pids[@]})) && wait "${pids[@]}"
+    return 0
+}
+
+# Records <img> as the current wallpaper and updates the panel icon.
+commit() {
+    if [[ -n ${1:-} ]]; then
+        CURRENT=$1
+        if [[ $MODE != auto ]]; then
+            pair_key "$1"
+            PAIR=$KEY
+        fi
+    fi
+    save_state
+    refresh_panel
+}
+
+# Switch to light or dark, keeping the same picture when it has a pair.
+go_theme() {
+    local theme=$1 dir cur img="" mine=0
+    [[ $theme == dark ]] && dir=$DARK_DIR || dir=$LIGHT_DIR
+
+    current_wallpaper
+    cur=$CUR
+    # The partner of whatever is on screen, matched by name. That includes a
+    # picture you picked yourself, even from another folder.
+    if [[ -n $cur ]]; then
+        pair_key "$cur"
+        img=$(find_variant "$KEY" "$dir")
+    fi
+    # Coming back from Auto (or from a picture without a partner elsewhere):
+    # the last light/dark pair.
+    if [[ -z $img && -n $PAIR ]] && ! in_dir "$cur" "$LIGHT_DIR" && ! in_dir "$cur" "$DARK_DIR"; then
+        img=$(find_variant "$PAIR" "$dir")
+    fi
+    [[ -n $img ]] || img=$(random_image "$dir" "$cur")
+
+    freeze_screen && mine=1
+    MODE=$theme
+    commit "$img"
+    if [[ -n $img ]]; then
+        set_wallpaper "$img"
+    else
+        warn "no wallpapers in $dir"
+    fi
+    apply_theme "$theme"
+    ((mine)) && unfreeze_screen 200 2500
+
+    if [[ $theme == dark ]]; then
+        notify weather-clear-night "Dark mode" "${img##*/}"
+    else
+        notify weather-clear "Light mode" "${img##*/}"
+    fi
+}
+
+auto_rotate() {
+    local img mine=0
+    current_wallpaper
+    printf -v LAST_AUTO '%(%s)T' -1
+    if img=$(random_image "$COLORFUL_DIR" "$CUR"); then
+        freeze_screen && mine=1
+        commit "$img"
+        set_wallpaper "$img"
+        ((mine)) && unfreeze_screen 120 800
+        notify preferences-desktop-wallpaper "Auto wallpaper" "${img##*/}"
+    else
+        commit
+        warn "no wallpapers in $COLORFUL_DIR"
+    fi
+}
+
+# ---------------------------------------------------------------- commands --
+
+cmd_light() { go_theme light; }
+cmd_dark() { go_theme dark; }
+
+cmd_toggle() {
+    if [[ $(current_theme) == dark ]]; then go_theme light; else go_theme dark; fi
+}
+
+cmd_auto() {
+    local mine=0
+    freeze_screen && mine=1
+    MODE=auto
+    auto_rotate
+    [[ $AUTO_THEME == @(light|dark) ]] && apply_theme "$AUTO_THEME"
+    ((mine)) && unfreeze_screen 200 2500
+    return 0
+}
+
+cmd_next() {
+    if [[ $MODE == auto ]]; then
+        auto_rotate
+        return
+    fi
+    local dir i idx=-1 img mine=0
+    local -a imgs=()
+    [[ $MODE == dark ]] && dir=$DARK_DIR || dir=$LIGHT_DIR
+    while IFS= read -r i; do imgs+=("$i"); done < <(list_images "$dir")
+    ((${#imgs[@]})) || { warn "no wallpapers in $dir"; return; }
+    current_wallpaper
+    for i in "${!imgs[@]}"; do [[ ${imgs[i]} == "$CUR" ]] && idx=$i; done
+    img=${imgs[(idx + 1) % ${#imgs[@]}]}
+    freeze_screen && mine=1
+    commit "$img"
+    set_wallpaper "$img"
+    ((mine)) && unfreeze_screen 120 800
+}
+
+# Called by the panel's timer: change the Auto wallpaper when it is due.
+cmd_tick() {
+    take_lock -n || return 0
+    load_state
+    [[ $MODE == auto ]] || return 0
+    local now
+    printf -v now '%(%s)T' -1
+    ((now - LAST_AUTO >= AUTO_INTERVAL * 60)) || return 0
+    auto_rotate
+}
+
+# Runs every few seconds inside the panel, which freezes until it finishes,
+# so it only reads small files and starts nothing it has to wait for.
+cmd_panel() {
+    local now icon label tip left spawned=0
+    printf -v now '%(%s)T' -1
+    if [[ $MODE == auto ]] && ((now - LAST_AUTO >= AUTO_INTERVAL * 60)); then
+        detach "$SELF" tick
+    fi
+    # Start the animation helper at login, so the first click is quick too.
+    if [[ $ANIMATION == true ]] && ! fade_alive; then
+        [[ -r $RUN_DIR/fade.spawned ]] && read -r spawned <"$RUN_DIR/fade.spawned"
+        ((now - ${spawned:-0} >= 60)) && fade_spawn
+    fi
+
+    case $MODE in
+        dark) icon=$PANEL_ICON_DARK label="Dark mode" ;;
+        auto) icon=$PANEL_ICON_AUTO label="Auto (colorful)" ;;
+        *) icon=$PANEL_ICON_LIGHT label="Light mode" ;;
+    esac
+    tip="<b>$label</b>"
+    if [[ -n $CURRENT ]]; then
+        xml_escape "${CURRENT##*/}"
+        tip+=$'\n'"$ESCAPED"
+    fi
+    if [[ $MODE == auto ]]; then
+        left=$(((LAST_AUTO + AUTO_INTERVAL * 60 - now + 59) / 60))
+        ((left < 1)) && left=1
+        tip+=$'\n'"Next change in ~$left min"
+    fi
+    tip+=$'\n\n'"Click icon: switch Light ⇄ Dark"$'\n'"Click ▾: Auto, Next wallpaper, settings…"
+
+    printf '<icon>%s</icon><iconclick>%s toggle</iconclick>' "$icon" "$SELF"
+    printf '<txt> ▾ </txt><txtclick>%s menu</txtclick>' "$SELF"
+    printf '<tool>%s</tool>\n' "$tip"
+}
+
+cmd_menu() {
+    command -v zenity >/dev/null || die "zenity is not installed"
+    local now choice
+    case $MODE in
+        dark) now="Dark" ;;
+        auto) now="Auto (colorful)" ;;
+        *) now="Light" ;;
+    esac
+    choice=$(zenity --list --title="solune" --text="Current mode: $now" \
+        --hide-header --column=id --column=Action --hide-column=1 --print-column=1 \
+        --width=400 --height=440 \
+        light "☀  Light  —  light theme + light wallpaper" \
+        dark "☾  Dark  —  dark theme + dark wallpaper" \
+        auto "✿  Auto  —  random colorful wallpaper every $AUTO_INTERVAL min" \
+        next "↻  Next wallpaper" \
+        folder "▤  Open wallpaper folder" \
+        settings "⚙  Edit settings" 2>/dev/null) || return 0
+    choice=${choice%%|*}
+
+    case $choice in
+        light | dark | auto | next)
+            sleep 0.1 # let the menu vanish before the screen is frozen
+            run_action "$choice"
+            ;;
+        folder)
+            mkdir -p "$WALLPAPER_DIR"
+            xdg-open "$WALLPAPER_DIR" &>/dev/null &
+            ;;
+        settings) cmd_config >/dev/null ;;
+    esac
+}
+
+# Opens your settings. They apply on the next switch, or now with `solune apply`.
+cmd_config() {
+    mkdir -p "$SOLUNE_HOME"
+    if [[ ! -f $CONF ]]; then
+        if [[ -f $BASE_DIR/solune.conf ]]; then
+            cp "$BASE_DIR/solune.conf" "$CONF"
+        else
+            echo "# solune settings — see the README for what you can set here" >"$CONF"
+        fi
+    fi
+    echo "Settings: $CONF"
+    if [[ -t 0 && -n ${VISUAL:-${EDITOR:-}} ]]; then
+        ${VISUAL:-$EDITOR} "$CONF"
+    elif [[ -n ${DISPLAY:-} ]]; then
+        detach xdg-open "$CONF"
+    else
+        "${EDITOR:-nano}" "$CONF"
+    fi
+    echo "Saved changes apply on the next switch. To apply them now: solune apply"
+}
+
+# Applies the current settings right away, keeping the current mode.
+cmd_apply() {
+    case $MODE in
+        light | dark) go_theme "$MODE" ;;
+        auto)
+            [[ $AUTO_THEME == @(light|dark) ]] && apply_theme "$AUTO_THEME"
+            current_wallpaper
+            if in_dir "$CUR" "$COLORFUL_DIR" && [[ -f $CUR ]]; then
+                commit "$CUR"
+                set_wallpaper "$CUR"
+            else
+                auto_rotate
+            fi
+            ;;
+    esac
+    start_resizing
+    echo "Applied: $MODE mode, wallpapers from $WALLPAPER_DIR"
+}
+
+# Makes screen-sized copies of every wallpaper, at low priority, and removes
+# copies of pictures that were deleted or edited.
+cmd_cache() {
+    imagemagick || die "ImageMagick is not installed"
+    mkdir -p "$STATE_DIR"
+    exec 8>"$STATE_DIR/cache.lock"
+    flock -n 8 || return 0
+    screen_info
+
+    local dir="$RESIZED_DIR/${SCREEN_W}x${SCREEN_H}" f made=0
+    local -A keep=()
+    mkdir -p "$dir"
+    while IFS= read -r f; do
+        resized_path "$f" || continue
+        keep[$RESIZED]=1
+        resized_ready "$f" && continue
+        make_resized "$f" "$RESIZED"
+        ((made++))
+    done < <(list_images "$LIGHT_DIR"; list_images "$DARK_DIR"; list_images "$COLORFUL_DIR")
+
+    # Remove copies whose picture is gone, and folders left empty.
+    while IFS= read -r -d '' f; do
+        [[ -n ${keep[$f]:-} ]] || rm -f "$f"
+    done < <(find "$dir" \( -type f -o -type l \) -print0)
+    find "$dir" -mindepth 1 -type d -empty -delete 2>/dev/null
+    [[ -t 1 ]] && echo "Screen-sized copies ready in $dir ($made new)"
+    return 0
+}
+
+cmd_status() {
+    local f key ready=0 total=0 anim
+    local -a unpaired=()
+    current_wallpaper
+    if [[ $ANIMATION != true ]]; then
+        anim="off"
+    elif fade_alive; then
+        anim="on (${ANIMATION_MS} ms)"
+    elif anim=$(python3 "$FADE_BIN" check 2>&1); then
+        anim="on (${ANIMATION_MS} ms, helper starts on first use)"
+    else
+        anim="unavailable: $anim"
+    fi
+
+    printf 'Mode:       %s\n' "$MODE"
+    printf 'Theme:      %s (%s)\n' "$(current_theme)" "$(xfconf-query -c xsettings -p /Net/ThemeName 2>/dev/null)"
+    printf 'Wallpaper:  %s\n' "${CUR:-?}"
+    printf 'Last pair:  %s\n' "${PAIR:-none}"
+    printf 'Folder:     %s\n' "$WALLPAPER_DIR"
+    printf 'Light:      %s (%d images)\n' "$LIGHT_DIR" "$(list_images "$LIGHT_DIR" | wc -l)"
+    printf 'Dark:       %s (%d images)\n' "$DARK_DIR" "$(list_images "$DARK_DIR" | wc -l)"
+    printf 'Colorful:   %s (%d images, every %d min)\n' "$COLORFUL_DIR" "$(list_images "$COLORFUL_DIR" | wc -l)" "$AUTO_INTERVAL"
+    while IFS= read -r f; do
+        ((total++))
+        resized_path "$f" && resized_ready "$f" && ((ready++))
+    done < <(list_images "$LIGHT_DIR"; list_images "$DARK_DIR"; list_images "$COLORFUL_DIR")
+    printf 'Resized:    %d of %d ready for %sx%s\n' "$ready" "$total" "$SCREEN_W" "$SCREEN_H"
+    printf 'Animation:  %s\n' "$anim"
+    printf 'Settings:   %s  (change any time: solune config)\n' "$CONF"
+
+    while IFS= read -r f; do
+        pair_key "$f"
+        key=$KEY
+        find_variant "$key" "$DARK_DIR" >/dev/null || unpaired+=("${f#"$WALLPAPER_DIR"/}")
+    done < <(list_images "$LIGHT_DIR")
+    while IFS= read -r f; do
+        pair_key "$f"
+        key=$KEY
+        find_variant "$key" "$LIGHT_DIR" >/dev/null || unpaired+=("${f#"$WALLPAPER_DIR"/}")
+    done < <(list_images "$DARK_DIR")
+    if ((${#unpaired[@]})); then
+        printf '\nNo partner found for:\n'
+        printf '  %s\n' "${unpaired[@]}"
+    fi
+}
+
+# ------------------------------------------------------------------- panel --
+
+genmon_installed() {
+    compgen -G '/usr/lib/*/xfce4/panel/plugins/libgenmon.so' >/dev/null ||
+        compgen -G '/usr/lib*/xfce4/panel/plugins/libgenmon.so' >/dev/null ||
+        compgen -G '/usr/local/lib*/xfce4/panel/plugins/libgenmon.so' >/dev/null
+}
+
+# Panel plugin ids of genmon items that run solune. genmon 4.1 keeps its
+# command in an .rc file, 4.2+ in xfconf; check both.
+our_genmon_ids() {
+    local p val id rc
+    while read -r p val; do
+        [[ $p =~ ^/plugins/plugin-([0-9]+)$ && $val == genmon ]] || continue
+        id=${BASH_REMATCH[1]}
+        rc="$PANEL_RC_DIR/genmon-$id.rc"
+        if [[ $(xfconf-query -c xfce4-panel -p "/plugins/plugin-$id/command" 2>/dev/null) == *solune* ]] ||
+            { [[ -f $rc ]] && grep -q 'solune' "$rc"; }; then
+            echo "$id"
+        fi
+    done < <(xfconf-query -c xfce4-panel -lv 2>/dev/null)
+}
+
+# The command a genmon item runs.
+button_command() {
+    local cmd rc="$PANEL_RC_DIR/genmon-$1.rc"
+    cmd=$(xfconf-query -c xfce4-panel -p "/plugins/plugin-$1/command" 2>/dev/null)
+    [[ -z $cmd && -f $rc ]] && cmd=$(sed -n 's/^Command=//p' "$rc")
+    printf '%s\n' "$cmd"
+}
+
+# Restart the panel and wait for the old one to exit; it saves every
+# plugin's settings on the way out.
+restart_panel() {
+    local old
+    old=$(pgrep -xu "$USER" xfce4-panel | head -n1)
+    timeout 10 xfce4-panel -r &>/dev/null
+    for _ in {1..40}; do
+        [[ -n $old && -d /proc/$old ]] || return 0
+        sleep 0.25
+    done
+}
+
+# Ask the panel button to redraw now. Talks to the panel over D-Bus directly
+# (5 ms) instead of through `xfce4-panel --plugin-event` (150 ms).
+refresh_panel() {
+    local id=""
+    [[ -r $BUTTON_FILE ]] && read -r id <"$BUTTON_FILE"
+    [[ -n $id ]] || return 0
+    dbus-send --session --type=method_call --dest=org.xfce.Panel /org/xfce/Panel \
+        org.xfce.Panel.PluginEvent string:"$id" string:refresh variant:boolean:true &>/dev/null ||
+        detach xfce4-panel --plugin-event="$id:refresh:bool:true"
+}
+
+xfconf_ints() { xfconf-query -c xfce4-panel -p "$1" 2>/dev/null | grep -E '^[0-9]+$'; }
+
+set_plugin_ids() {
+    local panel=$1 i
+    shift
+    local -a args=()
+    for i in "$@"; do args+=(-t int -s "$i"); done
+    xfconf-query -c xfce4-panel -p "/panels/panel-$panel/plugin-ids" -n --force-array "${args[@]}"
+}
+
+cmd_add_button() {
+    command -v xfce4-panel >/dev/null || die "xfce4-panel not found — is this XFCE?"
+    genmon_installed || die "xfce4-genmon-plugin is not installed (see the README for the package name)"
+    mkdir -p "$STATE_DIR"
+
+    local existing
+    existing=$(our_genmon_ids | head -n1)
+    if [[ -n $existing ]]; then
+        if [[ $(button_command "$existing") == "$SELF panel" ]]; then
+            echo "genmon-$existing" >"$BUTTON_FILE"
+            echo "The solune button is already on the panel (genmon-$existing)."
+            refresh_panel
+            return
+        fi
+        echo "Moving the solune button to this copy of solune..."
+        cmd_remove_button >/dev/null
+    fi
+
+    # Back up the panel layout before touching it.
+    local backup
+    backup="$STATE_DIR/xfce4-panel.backup.$(date +%Y%m%d-%H%M%S).xml"
+    cp "$HOME/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-panel.xml" "$backup" 2>/dev/null &&
+        echo "Backed up your panel layout to $backup"
+
+    local panel new max=0 i name pos font
+    panel=$(xfconf_ints /panels | head -n1)
+    [[ -n $panel ]] || die "no XFCE panel found"
+    for i in $(xfconf-query -c xfce4-panel -l | grep -oE '^/plugins/plugin-[0-9]+' | grep -oE '[0-9]+$'); do
+        ((i > max)) && max=$i
+    done
+    new=$((max + 1))
+
+    # genmon 4.1 turns a "(default)" font into a 0pt font, so give it a real one.
+    font=$(xfconf-query -c xsettings -p /Gtk/FontName 2>/dev/null)
+    font=${font:-Sans 10}
+
+    # genmon 4.1 reads an .rc file...
+    mkdir -p "$PANEL_RC_DIR"
+    cat >"$PANEL_RC_DIR/genmon-$new.rc" <<EOF
+Command=$SELF panel
+UseLabel=0
+Text=
+UpdatePeriod=10000
+Font=$font
+EOF
+    # ...and genmon 4.2+ reads xfconf.
+    local base="/plugins/plugin-$new"
+    xfconf-query -c xfce4-panel -p "$base" -n -t string -s genmon
+    xfconf-query -c xfce4-panel -p "$base/command" -n -t string -s "$SELF panel"
+    xfconf-query -c xfce4-panel -p "$base/use-label" -n -t bool -s false
+    xfconf-query -c xfce4-panel -p "$base/text" -n -t string -s ""
+    xfconf-query -c xfce4-panel -p "$base/update-period" -n -t int -s 10000
+    xfconf-query -c xfce4-panel -p "$base/font" -n -t string -s "$font"
+
+    # Place it just left of the clock (and the separator before it).
+    local -a ids=()
+    while IFS= read -r i; do ids+=("$i"); done < <(xfconf_ints "/panels/panel-$panel/plugin-ids")
+    pos=${#ids[@]}
+    for i in "${!ids[@]}"; do
+        name=$(xfconf-query -c xfce4-panel -p "/plugins/plugin-${ids[i]}" 2>/dev/null)
+        if [[ $name == clock ]]; then
+            pos=$i
+            if ((i > 0)) && [[ $(xfconf-query -c xfce4-panel -p "/plugins/plugin-${ids[i - 1]}" 2>/dev/null) == separator ]]; then
+                pos=$((i - 1))
+            fi
+            break
+        fi
+    done
+    set_plugin_ids "$panel" "${ids[@]:0:pos}" "$new" "${ids[@]:pos}"
+    echo "genmon-$new" >"$BUTTON_FILE"
+
+    restart_panel
+    echo "Added the solune button to the panel (genmon-$new)."
+}
+
+cmd_remove_button() {
+    local id panel i
+    local -a ids keep removed=()
+    for id in $(our_genmon_ids); do
+        for panel in $(xfconf_ints /panels); do
+            ids=() keep=()
+            while IFS= read -r i; do ids+=("$i"); done < <(xfconf_ints "/panels/panel-$panel/plugin-ids")
+            for i in "${ids[@]}"; do [[ $i == "$id" ]] || keep+=("$i"); done
+            ((${#keep[@]} != ${#ids[@]})) && set_plugin_ids "$panel" "${keep[@]}"
+        done
+        xfconf-query -c xfce4-panel -p "/plugins/plugin-$id" -r -R 2>/dev/null
+        removed+=("$id")
+    done
+    rm -f "$BUTTON_FILE"
+    if ((${#removed[@]})); then
+        restart_panel
+        for id in "${removed[@]}"; do
+            rm -f "$PANEL_RC_DIR/genmon-$id.rc"
+            echo "Removed the solune button (genmon-$id)."
+        done
+    else
+        echo "No solune button on the panel."
+    fi
+}
+
+cmd_uninstall() {
+    cmd_remove_button
+    load_state
+    # The wallpaper on screen is a resized copy; point back at the original.
+    if [[ -n $CURRENT && -f $CURRENT ]]; then
+        ORIGINAL_ONLY=1
+        set_wallpaper "$CURRENT"
+        echo "Wallpaper set back to the original ${CURRENT##*/}"
+    fi
+    if fade_alive; then
+        local out
+        exec {out}<>"$FADE_FIFO" && printf 'quit\n' >&"$out" && exec {out}>&-
+    fi
+    return 0
+}
+
+# -------------------------------------------------------------------- main --
+
+run_action() {
+    take_lock -w 15 || die "another switch is still running"
+    load_state
+    mkdir -p "$LIGHT_DIR" "$DARK_DIR" "$COLORFUL_DIR"
+    "cmd_$1"
+}
+
+usage() { sed -n '/^# Usage:/,/^$/p' "$SELF" | sed 's/^# \{0,1\}//'; }
+
+main() {
+    load_config
+    local cmd=${1:-toggle}
+    case $cmd in
+        toggle | light | dark | auto | next | apply) run_action "$cmd" ;;
+        config) cmd_config ;;
+        panel | menu | status)
+            load_state
+            "cmd_$cmd"
+            ;;
+        tick | cache | uninstall) "cmd_$cmd" ;;
+        paths) printf '%s\n' "$LIGHT_DIR" "$DARK_DIR" "$COLORFUL_DIR" ;;
+        add-button) cmd_add_button ;;
+        remove-button) cmd_remove_button ;;
+        version | --version | -v) echo "solune $SOLUNE_VERSION" ;;
+        help | --help | -h) usage ;;
+        *)
+            usage >&2
+            exit 2
+            ;;
+    esac
+}
+
+main "$@"

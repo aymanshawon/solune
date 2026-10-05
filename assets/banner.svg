@@ -1,0 +1,75 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="360" viewBox="0 0 1280 360" role="img" aria-label="solune: one-click light and dark mode for XFCE">
+  <defs>
+    <linearGradient id="sky" x1="0" y1="0" x2="1280" y2="0" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ffd6e7"/>
+      <stop offset="0.33" stop-color="#cfe9ff"/>
+      <stop offset="0.67" stop-color="#2c2558"/>
+      <stop offset="1" stop-color="#12152e"/>
+    </linearGradient>
+    <!-- The text fades the other way, so it reads on both day and night. -->
+    <linearGradient id="ink" x1="400" y1="0" x2="880" y2="0" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#2c2558"/>
+      <stop offset="0.38" stop-color="#4a3d88"/>
+      <stop offset="0.62" stop-color="#e9ddff"/>
+      <stop offset="1" stop-color="#fff3cf"/>
+    </linearGradient>
+    <linearGradient id="hills" x1="0" y1="0" x2="1280" y2="0" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ade0bf"/>
+      <stop offset="0.35" stop-color="#c4ead0"/>
+      <stop offset="0.65" stop-color="#3a3270"/>
+      <stop offset="1" stop-color="#262153"/>
+    </linearGradient>
+    <radialGradient id="sunglow">
+      <stop offset="0.45" stop-color="#ffe9a8" stop-opacity="0.9"/>
+      <stop offset="1" stop-color="#ffe9a8" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="moonglow">
+      <stop offset="0.45" stop-color="#fff1c2" stop-opacity="0.45"/>
+      <stop offset="1" stop-color="#fff1c2" stop-opacity="0"/>
+    </radialGradient>
+    <mask id="crescent">
+      <circle cx="1060" cy="140" r="62" fill="#fff"/>
+      <circle cx="1092" cy="116" r="54" fill="#000"/>
+    </mask>
+    <clipPath id="card">
+      <rect width="1280" height="360" rx="28"/>
+    </clipPath>
+  </defs>
+
+  <g clip-path="url(#card)">
+    <rect width="1280" height="360" fill="url(#sky)"/>
+
+    <!-- day -->
+    <circle cx="210" cy="140" r="130" fill="url(#sunglow)"/>
+    <circle cx="210" cy="140" r="62" fill="#ffcf5a"/>
+    <g fill="#fff" opacity="0.9">
+      <ellipse cx="80" cy="245" rx="70" ry="24"/>
+      <ellipse cx="125" cy="228" rx="52" ry="30"/>
+      <ellipse cx="172" cy="248" rx="62" ry="22"/>
+      <ellipse cx="350" cy="85" rx="44" ry="15"/>
+      <ellipse cx="380" cy="75" rx="34" ry="19"/>
+      <ellipse cx="410" cy="88" rx="38" ry="13"/>
+    </g>
+
+    <!-- night -->
+    <g fill="#fff">
+      <circle cx="900" cy="60" r="2"/><circle cx="960" cy="230" r="1.5"/><circle cx="1150" cy="60" r="2.5"/>
+      <circle cx="1210" cy="190" r="1.5"/><circle cx="1180" cy="250" r="2"/><circle cx="880" cy="160" r="1.5"/>
+      <circle cx="990" cy="40" r="1.5"/><circle cx="1240" cy="100" r="2"/><circle cx="930" cy="110" r="1"/>
+      <circle cx="1120" cy="210" r="1"/><circle cx="1010" cy="250" r="1.5"/><circle cx="850" cy="240" r="1"/>
+    </g>
+    <circle cx="1060" cy="140" r="130" fill="url(#moonglow)"/>
+    <rect x="990" y="70" width="140" height="140" fill="#fff3cf" mask="url(#crescent)"/>
+
+    <!-- hills -->
+    <path d="M0 360 V300 C 160 250 320 250 470 290 C 600 325 700 320 830 285 C 980 245 1130 250 1280 300 V360 Z" fill="url(#hills)"/>
+
+    <!-- title -->
+    <text x="640" y="185" text-anchor="middle" fill="url(#ink)"
+          font-family="'Nunito', 'Quicksand', 'Ubuntu', 'Segoe UI', 'DejaVu Sans', sans-serif"
+          font-size="108" font-weight="800" letter-spacing="2">solune</text>
+    <text x="640" y="238" text-anchor="middle" fill="url(#ink)"
+          font-family="'Nunito', 'Quicksand', 'Ubuntu', 'Segoe UI', 'DejaVu Sans', sans-serif"
+          font-size="26" font-weight="600" letter-spacing="1">one-click light &amp; dark mode for XFCE</text>
+  </g>
+</svg>

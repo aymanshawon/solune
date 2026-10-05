@@ -1,0 +1,307 @@
+#!/usr/bin/env python3
+"""solune-fade — the smooth crossfade behind solune.
+
+A tiny helper that stays running in the background. Right before solune
+changes the theme or wallpaper it says "freeze": the helper covers the screen
+with a still picture of itself, so nothing flickers while apps restyle
+underneath. Then solune says "fade" and the picture melts away.
+
+    solune-fade daemon <runtime-dir>   run the helper (solune starts it)
+    solune-fade check                  exit 0 if animations can work here
+
+Protocol, one line per command on <runtime-dir>/fade.fifo:
+
+    freeze <reply-fifo>                cover the screen, answer "ready" on <reply-fifo>
+    fade <settle-ms> <duration-ms> [max-wait-ms]
+                                       wait <settle-ms>, then until the CPU calms down
+                                       (at most <max-wait-ms>), then fade out
+    quit
+"""
+
+import fcntl
+import os
+import signal
+import stat
+import sys
+
+SAFETY_MS = 6000  # never leave the screen frozen longer than this
+CALM = 0.7  # "calm" = CPU below 70% busy, twice in a row
+
+
+def cpu_sample():
+    with open("/proc/stat") as f:
+        values = [int(v) for v in f.readline().split()[1:9]]
+    return values[3] + values[4], sum(values)  # idle + iowait, total
+
+
+def smoothstep(t):
+    return t * t * (3 - 2 * t)
+
+
+def load_gtk():
+    import gi
+
+    gi.require_version("Gdk", "3.0")
+    gi.require_version("Gtk", "3.0")
+    import cairo
+    from gi.repository import Gdk, GLib, Gtk
+
+    return Gdk, GLib, Gtk, cairo
+
+
+def check():
+    try:
+        Gdk, _, Gtk, _ = load_gtk()
+    except (ImportError, ValueError) as err:
+        print(f"Python GTK bindings are missing ({err})", file=sys.stderr)
+        return 2
+    if not Gtk.init_check(sys.argv)[0]:
+        print("can't open the X display", file=sys.stderr)
+        return 3
+    if not Gdk.Screen.get_default().is_composited():
+        print("no compositor is running "
+              "(Window Manager Tweaks → Compositor → Enable display compositing)", file=sys.stderr)
+        return 4
+    return 0
+
+
+class Fader:
+    def __init__(self, run_dir):
+        self.Gdk, self.GLib, self.Gtk, self.cairo = load_gtk()
+        self.run_dir = os.path.realpath(run_dir)
+        self.fifo = os.path.join(self.run_dir, "fade.fifo")
+        self.pidfile = os.path.join(self.run_dir, "fade.pid")
+        self.buf = b""
+        self.win = None  # the overlay on screen, if any
+        self.safety = 0
+
+    def run(self):
+        os.makedirs(self.run_dir, mode=0o700, exist_ok=True)
+        lock = open(os.path.join(self.run_dir, "fade.lock"), "w")
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return 0  # another helper is already running
+        if not self.Gtk.init_check(sys.argv)[0]:
+            return 3
+        # Pin our own theme. Otherwise every switch makes this process re-read
+        # the new GTK theme too, which on a slow CPU stalls the fade by ~0.4 s.
+        # Settings an app sets itself win over the desktop's.
+        settings = self.Gtk.Settings.get_default()
+        settings.set_property("gtk-theme-name", "Adwaita")
+        settings.set_property("gtk-icon-theme-name", "hicolor")
+
+        if os.path.lexists(self.fifo):
+            os.unlink(self.fifo)
+        os.mkfifo(self.fifo, 0o600)
+        # Read+write, so the pipe never hits end-of-file between clients.
+        fd = os.open(self.fifo, os.O_RDWR | os.O_NONBLOCK)
+        self.GLib.unix_fd_add_full(self.GLib.PRIORITY_DEFAULT, fd, self.GLib.IOCondition.IN, self.on_input)
+        for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            self.GLib.unix_signal_add(self.GLib.PRIORITY_DEFAULT, sig, self.Gtk.main_quit)
+        with open(self.pidfile, "w") as f:
+            f.write(f"{os.getpid()}\n")
+
+        self.Gtk.main()
+
+        for path in (self.fifo, self.pidfile):
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+        return 0
+
+    # ---- commands -----------------------------------------------------------
+
+    def on_input(self, fd, _condition):
+        try:
+            self.buf += os.read(fd, 4096)
+        except BlockingIOError:
+            return True
+        while b"\n" in self.buf:
+            line, self.buf = self.buf.split(b"\n", 1)
+            self.handle(line.decode(errors="replace").split())
+        return True
+
+    def handle(self, words):
+        if not words:
+            return
+        cmd, args = words[0], words[1:]
+        if cmd == "freeze" and args:
+            self.freeze(args[0])
+        elif cmd == "fade" and self.win is not None:
+            settle = max(to_int(args[0] if args else None, 150), 0)
+            duration = to_int(args[1] if len(args) > 1 else None, 400)
+            max_wait = max(to_int(args[2] if len(args) > 2 else None, 0), 0)
+            deadline = self.GLib.get_monotonic_time() + (settle + max_wait) * 1000
+            self.GLib.timeout_add(settle, self.wait_for_calm, self.win, duration, deadline)
+        elif cmd == "quit":
+            self.Gtk.main_quit()
+
+    def reply(self, path, message):
+        # Only answer on a FIFO inside our private runtime dir.
+        path = os.path.realpath(path)
+        if os.path.dirname(path) != self.run_dir:
+            return
+        try:
+            if not stat.S_ISFIFO(os.stat(path).st_mode):
+                return
+            fd = os.open(path, os.O_WRONLY | os.O_NONBLOCK)
+        except OSError:
+            return
+        try:
+            os.write(fd, f"{message}\n".encode())
+        finally:
+            os.close(fd)
+
+    # ---- freezing -----------------------------------------------------------
+
+    def freeze(self, reply):
+        Gdk, Gtk = self.Gdk, self.Gtk
+        screen = Gdk.Screen.get_default()
+        if not screen.is_composited():
+            self.reply(reply, "nocomp")
+            return
+
+        # If a fade is still running, this picture includes it, so the next
+        # switch continues smoothly from whatever is on screen right now.
+        root = Gdk.get_default_root_window()
+        width, height = root.get_width(), root.get_height()
+        pixbuf = Gdk.pixbuf_get_from_window(root, 0, 0, width, height)
+        if pixbuf is None:
+            self.reply(reply, "fail")
+            return
+        shot = Gdk.cairo_surface_create_from_pixbuf(pixbuf, root.get_scale_factor(), None)
+        del pixbuf
+
+        win = Gtk.Window(type=Gtk.WindowType.POPUP)  # no borders, no focus, above everything
+        # We fade by drawing with less and less alpha ourselves: xfwm4 ignores
+        # opacity changes on popup windows once they are shown.
+        win.set_visual(screen.get_rgba_visual())
+        win.set_app_paintable(True)
+        # One pixel short of full screen: xfwm4 takes full-screen popups out of
+        # compositing ("unredirect overlays") when the theme changes, and then
+        # our see-through fade would draw as a solid picture.
+        win.set_default_size(width, height - 1)
+        win.move(0, 0)
+        win.shot, win.pending_reply, win.fading, win.alpha = shot, reply, False, 1.0
+        # Clicks and typing go straight through to the windows underneath.
+        win.connect("realize", lambda w: w.input_shape_combine_region(self.cairo.Region()))
+        win.connect("draw", self.on_draw)
+        win.show()
+
+    def on_draw(self, win, cr):
+        # Clear to fully transparent, then lay the picture on top at our alpha.
+        cr.set_operator(self.cairo.OPERATOR_SOURCE)
+        cr.set_source_rgba(0, 0, 0, 0)
+        cr.paint()
+        cr.set_operator(self.cairo.OPERATOR_OVER)
+        cr.set_source_surface(win.shot, 0, 0)
+        cr.paint_with_alpha(win.alpha)
+        if win.pending_reply:
+            reply, win.pending_reply = win.pending_reply, None
+            # Give the compositor a couple of frames to actually show us.
+            self.GLib.timeout_add(40, self.on_shown, win, reply)
+        return True
+
+    def on_shown(self, win, reply):
+        old, self.win = self.win, win
+        if old is not None:
+            old.destroy()
+        self.reply(reply, "ready")
+        self.cancel_safety()
+        self.safety = self.GLib.timeout_add(SAFETY_MS, self.on_safety)
+        return False
+
+    def on_safety(self):
+        self.safety = 0
+        self.start_fade(400)
+        return False
+
+    def cancel_safety(self):
+        if self.safety:
+            self.GLib.source_remove(self.safety)
+            self.safety = 0
+
+    # ---- fading -------------------------------------------------------------
+
+    def wait_for_calm(self, win, duration, deadline):
+        # After a theme change every app redraws at once; on a slow CPU that
+        # starves the compositor and a fade would stutter or not show at all.
+        # So wait, still frozen, until things settle.
+        prev = cpu_sample()
+        calm = 0
+
+        def poll():
+            nonlocal prev, calm
+            idle, total = cpu_sample()
+            busy = 1 - (idle - prev[0]) / max(total - prev[1], 1)
+            prev = (idle, total)
+            calm = calm + 1 if busy < CALM else 0
+            if calm >= 2 or self.GLib.get_monotonic_time() >= deadline:
+                self.start_fade(duration, win)
+                return False
+            return True
+
+        if self.GLib.get_monotonic_time() >= deadline:
+            self.start_fade(duration, win)
+        else:
+            self.GLib.timeout_add(100, poll)
+        return False
+
+    def start_fade(self, duration, win=None):
+        if win is None:
+            win = self.win
+        if win is None or win is not self.win or win.fading:
+            return False
+        self.cancel_safety()
+        win.fading = True
+        if duration <= 0:
+            self.finish(win)
+            return False
+
+        start = None
+
+        def tick(widget, clock):
+            nonlocal start
+            now = clock.get_frame_time()
+            if start is None:
+                start = now
+            t = min(1.0, (now - start) / (duration * 1000))
+            widget.alpha = 1.0 - smoothstep(t)
+            widget.queue_draw()
+            if t >= 1.0:
+                self.finish(widget)
+                return False
+            return True
+
+        win.add_tick_callback(tick)
+        return False
+
+    def finish(self, win):
+        if self.win is win:
+            self.win = None
+        win.destroy()
+
+
+def to_int(text, default):
+    try:
+        return int(text)
+    except (TypeError, ValueError):
+        return default
+
+
+def main(argv):
+    if len(argv) >= 2 and argv[1] == "check":
+        return check()
+    if len(argv) >= 3 and argv[1] == "daemon":
+        # Drop every file descriptor we inherited. The panel waits for its
+        # command's output pipe to close; holding a copy would hang it forever.
+        os.closerange(3, os.sysconf("SC_OPEN_MAX"))
+        return Fader(argv[2]).run()
+    print(__doc__.strip(), file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
